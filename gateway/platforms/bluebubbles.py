@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -55,6 +56,11 @@ _TAPBACK_REMOVED = {
 
 # Webhook event types that carry user messages
 _MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
+
+# Dedup TTL: BlueBubbles dispatches each incoming message twice (~500-900ms apart)
+# due to dual detection (phone helper + Mac Messages DB sync).  Dedup keeps the
+# last-seen message GUID for this window so the second dispatch is silently ignored.
+_DEDUP_TTL = 5.0  # seconds
 
 # Log redaction patterns
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
@@ -129,6 +135,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: Dict[str, str] = {}
+        self._recent_guids: Dict[str, float] = {}  # message_guid -> timestamp for dedup
 
     # ------------------------------------------------------------------
     # API helpers
@@ -741,6 +748,29 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return None
 
     # ------------------------------------------------------------------
+    # Inbound message dedup (BlueBubbles fires each message twice)
+    # ------------------------------------------------------------------
+
+    def _check_dedup(self, guid: Optional[str]) -> bool:
+        """Return True if *guid* was already processed within the TTL window.
+
+        Silently prunes stale entries on each call so the cache doesn't grow
+        unbounded during long sessions.
+        """
+        now = time.time()
+        # Opportunistic cleanup — sweep every call; the dict is tiny.
+        stale = [g for g, ts in self._recent_guids.items() if now - ts > _DEDUP_TTL]
+        for g in stale:
+            del self._recent_guids[g]
+        if not guid:
+            return False
+        if guid in self._recent_guids:
+            logger.debug("[bluebubbles] ignoring duplicate message %s", guid)
+            return True
+        self._recent_guids[guid] = now
+        return False
+
+    # ------------------------------------------------------------------
     # Webhook handling
     # ------------------------------------------------------------------
 
@@ -900,6 +930,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
+
+        # --- Dedup: BlueBubbles fires each incoming message twice ---
+        message_guid = self._value(
+            record.get("guid"),
+            record.get("messageGuid"),
+            record.get("id"),
+        )
+        if message_guid and self._check_dedup(message_guid):
+            return web.Response(text="ok")
+
         source = self.build_source(
             chat_id=session_chat_id,
             chat_name=chat_identifier or sender,
@@ -913,11 +953,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=payload,
-            message_id=self._value(
-                record.get("guid"),
-                record.get("messageGuid"),
-                record.get("id"),
-            ),
+            message_id=message_guid,
             reply_to_message_id=self._value(
                 record.get("threadOriginatorGuid"),
                 record.get("associatedMessageGuid"),
