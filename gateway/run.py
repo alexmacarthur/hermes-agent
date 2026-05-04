@@ -3098,9 +3098,31 @@ class GatewayRunner:
             )
         asyncio.create_task(self._platform_reconnect_watcher())
 
+        # Background stale-code self-check — restarts immediately when source
+        # files change (e.g. after ``hermes update``), instead of waiting
+        # for the next inbound message.
+        asyncio.create_task(self._stale_code_watcher())
+
         logger.info("Press Ctrl+C to stop")
         
         return True
+
+    async def _stale_code_watcher(self, interval: int = 30) -> None:
+        """Periodically check whether gateway source code has been updated.
+
+        Runs every ``interval`` seconds (default 30).  Delegates to the
+        existing stale-code detection logic so this is a single source of
+        truth — no new mtime comparison code.
+        """
+        await asyncio.sleep(10)  # let the gateway fully initialize first
+        while self._running:
+            try:
+                if self._detect_stale_code():
+                    self._trigger_stale_code_restart()
+                    return  # _trigger_stale_code_restart fires an async restart
+            except Exception:
+                logger.debug("Stale-code self-check watcher error", exc_info=True)
+            await asyncio.sleep(interval)
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
